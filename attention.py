@@ -6,12 +6,13 @@ import torch.nn as nn
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class SelfAttention(nn.Module):
-    def __init__(self, d, d_k, d_v):
+    def __init__(self, d, d_k, d_v, causal=False):
         super().__init__()
         # three nn.Linear layers, no bias
         self.W_Q = nn.Linear(d,d_k, bias=False)
         self.W_K = nn.Linear(d,d_k, bias=False) 
         self.W_V = nn.Linear(d,d_v, bias=False)
+        self.causal=causal
 
     def forward(self, X):
         Q =self.W_Q(X)
@@ -19,6 +20,12 @@ class SelfAttention(nn.Module):
         V =self.W_V(X)
 
         S = Q @ K.transpose(-2, -1)
+
+        if self.causal:
+            T = X.shape[-2]
+            mask = torch.tril(torch.ones(T, T, device=X.device))
+            S = S.masked_fill(mask == 0, float("-inf"))
+        
         A = torch.softmax(S/math.sqrt(K.shape[-1]), dim =-1)
         out = A @ V
         return out, A
