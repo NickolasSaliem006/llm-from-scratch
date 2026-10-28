@@ -31,24 +31,39 @@ class SelfAttention(nn.Module):
         return out, A
 
 
-X   = torch.tensor([[1,0,1,1],[1,0,0,0],[0,1,0,0]], dtype=torch.float32, device=device)
-W_Q = torch.tensor([[0,0],[1,1],[0,0],[0,0]],       dtype=torch.float32, device=device)
-W_K = torch.tensor([[1,0],[0,0],[0,1],[0,1]],       dtype=torch.float32, device=device)
-W_V = torch.tensor([[1,0],[0,0],[0,1],[0,0]],       dtype=torch.float32, device=device)
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads, causal=False):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.causal = causal
+        self.W_Q = nn.Linear(d_model, d_model, bias=False)
+        self.W_K = nn.Linear(d_model, d_model, bias=False) 
+        self.W_V = nn.Linear(d_model, d_model, bias=False)
+        self.W_O = nn.Linear(d_model, d_model, bias=False)
+        
+    def forward(self, X):
+        B, T, _ = X.shape
 
-model = SelfAttention(4, 2, 2).to(device)
-print(sum(p.numel() for p in model.parameters()))
+        Q = self.W_Q(X)
+        K = self.W_K(X)
+        V = self.W_V(X)
 
-with torch.no_grad():
-    model.W_Q.weight.copy_(W_Q.T)
-    model.W_K.weight.copy_(W_K.T)
-    model.W_V.weight.copy_(W_V.T)
+        Q = Q.view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        K = K.view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        V = V.view(B, T, self.n_heads, self.d_k).transpose(1, 2)
 
-out, A = model(X)
-print(A[2], out[2])
+        S = Q @ K.transpose(-2, -1)
 
-X2 = torch.randn(2, 5, 8, device=device)
-model2 = SelfAttention(8, 4, 4).to(device)
-out2, A2 = model2(X2)
-print(out2.shape, A2.shape)
-print(A2.sum(dim=-1))
+        if self.causal:
+            T = X.shape[-2]
+            mask = torch.tril(torch.ones(T, T, device=X.device))
+            S = S.masked_fill(mask == 0, float("-inf"))
+        
+        A = torch.softmax(S/math.sqrt(self.d_k), dim =-1)
+
+        out = A @ V
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        out = self.W_O(out) 
+        return out, A
