@@ -11,3 +11,10 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return x / rms * self.weight
+    
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_hidden):
+
+    def forward(self, x):
+        
