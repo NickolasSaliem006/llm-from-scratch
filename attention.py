@@ -2,6 +2,7 @@
 import math
 import torch
 import torch.nn as nn
+from rope import precompute_rope, apply_rope          
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -32,16 +33,21 @@ class SelfAttention(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, causal=False):
+    def __init__(self, d_model, n_heads, causal=False, max_seq_len=2048, rope=True):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.causal = causal
+        self.rope = rope
         self.W_Q = nn.Linear(d_model, d_model, bias=False)
         self.W_K = nn.Linear(d_model, d_model, bias=False) 
         self.W_V = nn.Linear(d_model, d_model, bias=False)
         self.W_O = nn.Linear(d_model, d_model, bias=False)
+
+        cos, sin = precompute_rope(self.d_k, max_seq_len)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
         
     def forward(self, X):
         B, T, _ = X.shape
@@ -54,10 +60,13 @@ class MultiHeadAttention(nn.Module):
         K = K.view(B, T, self.n_heads, self.d_k).transpose(1, 2)
         V = V.view(B, T, self.n_heads, self.d_k).transpose(1, 2)
 
+        if self.rope:
+            Q = apply_rope(Q, self.cos[:T], self.sin[:T])
+            K = apply_rope(K, self.cos[:T], self.sin[:T])
+
         S = Q @ K.transpose(-2, -1)
 
         if self.causal:
-            T = X.shape[-2]
             mask = torch.tril(torch.ones(T, T, device=X.device))
             S = S.masked_fill(mask == 0, float("-inf"))
         
