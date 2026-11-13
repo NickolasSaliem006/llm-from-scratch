@@ -20,6 +20,7 @@ n_heads = 6
 d_hidden = 1024         # ≈ 8/3 × d_model
 seq_len = 256           # T
 batch_size = 32         # B
+grad_accum_steps = 1    # micro-batches per optimizer step
 
 max_steps = 38000
 warmup_steps = 200
@@ -38,6 +39,8 @@ if os.environ.get("SMOKE") == "1":
     seq_len, batch_size = 64, 8
     max_steps, warmup_steps = 60, 10
     eval_every, eval_iters, log_every = 30, 5, 10
+    grad_accum_steps = 2
+    OUT_DIR = "checkpoints_smoke"   # never overwrite real checkpoints
 
 # ---------------------------------------------------------------- device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,13 +80,15 @@ model = LLM(vocab_size, d_model, n_layers, n_heads, d_hidden, max_seq_len=seq_le
 n_params = sum(p.numel() for p in model.parameters())
 print(f"parameters: {n_params / 1e6:.1f}M")
 
-RESUME = os.environ.get("RESUME")      # e.g. checkpoints/best.pt
-start_val = float("inf")
+RESUME = os.environ.get("RESUME")      # e.g. checkpoints/last.pt
+start_step = 0
+best_val = float("inf")
 if RESUME:
     ckpt = torch.load(RESUME, map_location=device)
     model.load_state_dict(ckpt["model"])
-    start_val = ckpt["val_loss"]
-    print(f"resumed from {RESUME} (step {ckpt['step']}, val {start_val:.4f})")
+    start_step = ckpt["step"] + 1
+    best_val = ckpt.get("best_val", ckpt["val_loss"])   # old checkpoints have no "best_val"
+    print(f"resumed from {RESUME} (step {ckpt['step']}, best val {best_val:.4f})")
 
 # weight decay only on matrices (Linear/Embedding), not on norm weights (1D)
 decay = [p for p in model.parameters() if p.dim() >= 2]
@@ -93,6 +98,8 @@ optimizer = torch.optim.AdamW(
      {"params": no_decay, "weight_decay": 0.0}],
     lr=max_lr, betas=(0.9, 0.95),
 )
+if RESUME:
+    optimizer.load_state_dict(ckpt["optimizer"])
 
 
 @torch.no_grad()
@@ -111,15 +118,20 @@ def estimate_loss():
     return out
 
 
+def save(path, step, val_loss):
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                "config": config, "step": step, "val_loss": val_loss, "best_val": best_val},
+               path)
+
+
 # ---------------------------------------------------------------- training loop
 os.makedirs(OUT_DIR, exist_ok=True)
 config = dict(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
               n_heads=n_heads, d_hidden=d_hidden, max_seq_len=seq_len)
-best_val = start_val
 t_start = time.time()
 t_last = time.time()
 
-for step in range(max_steps + 1):
+for step in range(start_step, max_steps + 1):
     lr = get_lr(step)
     for group in optimizer.param_groups:
         group["lr"] = lr
@@ -130,33 +142,34 @@ for step in range(max_steps + 1):
         print(f"step {step:6d} | train {losses['train']:.4f} | val {losses['val']:.4f}")
         if losses["val"] < best_val:
             best_val = losses["val"]
-            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                "config": config, "step": step, "val_loss": best_val},
-                os.path.join(OUT_DIR, "best.pt"))
+            save(os.path.join(OUT_DIR, "best.pt"), step, losses["val"])
+        save(os.path.join(OUT_DIR, "last.pt"), step, losses["val"])   # always: for crash resume
     if step == max_steps:
         break
 
-    # one training step
-    x, y = get_batch("train")
-    with ctx:
-        _, loss = model(x, y)
+    # one optimizer step = grad_accum_steps micro-batches
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    for _ in range(grad_accum_steps):
+        x, y = get_batch("train")
+        with ctx:
+            _, loss = model(x, y)
+        loss = loss / grad_accum_steps   # backward() adds into .grad, so average over micro-batches
+        loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
 
     # logging
-    if step % log_every == 0 and step > 0:
+    if step % log_every == 0 and step > start_step:
         if device == "cuda":
             torch.cuda.synchronize()
         now = time.time()
         dt = now - t_last
         t_last = now
-        tok_per_sec = batch_size * seq_len * log_every / dt
+        tok_per_sec = batch_size * seq_len * grad_accum_steps * log_every / dt
 
         elapsed = now - t_start
-        eta = elapsed / step * (max_steps - step)
-        print(f"step {step:6d} | loss {loss.item():.4f} | lr {lr:.2e} | "
+        eta = elapsed / (step - start_step) * (max_steps - step)
+        print(f"step {step:6d} | loss {loss.item() * grad_accum_steps:.4f} | lr {lr:.2e} | "
               f"grad {grad_norm:.2f} | {tok_per_sec:,.0f} tok/s | "
               f"elapsed {fmt_time(elapsed)} | eta {fmt_time(eta)}")
 
